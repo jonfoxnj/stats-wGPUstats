@@ -13,6 +13,7 @@
 #define bridge_h
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <libproc.h>
 
 typedef struct IOReportSubscriptionRef* IOReportSubscriptionRef;
 

@@ -376,3 +376,198 @@ internal class InfoReader: Reader<GPUs> {
         return (currentEnergy - self.previousANEEnergy) / elapsed
     }
 }
+
+// MARK: - Top processes
+
+// Per-process GPU usage, the same source Activity Monitor's "% GPU" column uses.
+// Every app that talks to the GPU owns one or more user clients under the IOAccelerator
+// service in the IORegistry. Each client exposes "IOUserClientCreator" ("pid 123, Name") and
+// an "AppUsage" array with the GPU time (ns) its command queues have consumed so far.
+// Usage % = GPU time gained during the interval / wall time of the interval. No root needed.
+public class ProcessReader: Reader<[TopProcess]> {
+    private let title: String = "GPU"
+    
+    private struct Client {
+        let id: UInt64
+        let pid: Int
+        let name: String
+        let gpuTime: UInt64
+    }
+    
+    private let readLock = NSLock()
+    private var previousClients: [UInt64: UInt64] = [:]
+    private var previousTimestamp: UInt64 = 0
+    private let minimumWindow: UInt64 = 250_000_000
+    
+    private var numberOfProcesses: Int {
+        Store.shared.int(key: "\(self.title)_processes", defaultValue: 8)
+    }
+    
+    public override func setup() {
+        self.popup = true
+        self.preview = true
+        self.setInterval(Store.shared.int(key: "\(self.title)_updateTopInterval", defaultValue: 1))
+    }
+    
+    public override func read() {
+        let limit = self.numberOfProcesses
+        if limit == 0 {
+            return
+        }
+        
+        self.readLock.lock()
+        defer { self.readLock.unlock() }
+        
+        // nil means the registry changed mid-walk; skip this tick rather than diff against a partial list.
+        guard let clients = self.readClients() else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        
+        // Without a recent baseline (first read, or the popup was closed for a while) there is nothing
+        // to diff against: keep this sample and measure again shortly, without blocking the caller.
+        let staleAfter = UInt64(max(self.interval ?? 1, 1) * 3 * 1_000_000_000)
+        if self.previousTimestamp == 0 || now - self.previousTimestamp > staleAfter {
+            self.store(clients, at: now)
+            DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.read()
+            }
+            return
+        }
+        
+        // Two reads landing back to back (timer tick + settings change) would give a meaningless window.
+        let elapsed = now - self.previousTimestamp
+        guard elapsed >= self.minimumWindow else { return }
+        
+        var delta: [Int: UInt64] = [:]
+        var total: [Int: UInt64] = [:]
+        var names: [Int: String] = [:]
+        
+        for client in clients {
+            // A client missing from the last sample has no baseline yet, so it starts counting from here.
+            var gained: UInt64 = 0
+            if let before = self.previousClients[client.id], client.gpuTime > before {
+                gained = client.gpuTime - before
+            }
+            delta[client.pid, default: 0] += gained
+            total[client.pid, default: 0] += client.gpuTime
+            if names[client.pid] == nil || names[client.pid]?.isEmpty == true {
+                names[client.pid] = client.name
+            }
+        }
+        
+        self.store(clients, at: now)
+        
+        let ranked = delta.keys.map { pid -> (pid: Int, usage: Double, total: UInt64) in
+            let percent = min(Double(delta[pid] ?? 0) / Double(elapsed) * 100, 100)
+            return (pid, (percent * 10).rounded() / 10, total[pid] ?? 0)
+        }.sorted {
+            // Busiest right now first; ties (usually idle apps at 0%) by lifetime GPU time.
+            $0.usage != $1.usage ? $0.usage > $1.usage : $0.total > $1.total
+        }.prefix(limit)
+        
+        let processes = ranked.map { item in
+            TopProcess(pid: item.pid, name: self.processName(item.pid, fallback: names[item.pid] ?? ""), usage: item.usage)
+        }
+        
+        self.callback(processes)
+    }
+    
+    private func store(_ clients: [Client], at timestamp: UInt64) {
+        var list: [UInt64: UInt64] = [:]
+        clients.forEach { list[$0.id] = $0.gpuTime }
+        self.previousClients = list
+        self.previousTimestamp = timestamp
+    }
+    
+    private func readClients() -> [Client]? {
+        var iterator: io_iterator_t = io_iterator_t()
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(kIOAcceleratorClassName), &iterator) == kIOReturnSuccess else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+        
+        var list: [Client] = []
+        var seen: Set<UInt64> = []
+        var complete = true
+        
+        var accelerator = IOIteratorNext(iterator)
+        while accelerator != 0 {
+            complete = self.collect(accelerator, creator: nil, depth: 0, seen: &seen, into: &list) && complete
+            IOObjectRelease(accelerator)
+            accelerator = IOIteratorNext(iterator)
+        }
+        
+        guard complete, IOIteratorIsValid(iterator) != 0 else { return nil }
+        return list
+    }
+    
+    // Apple Silicon keeps "AppUsage" on the user clients right under the accelerator. Look one level
+    // deeper only when a node doesn't report it itself, so the same GPU time is never counted twice.
+    // Returns false if an iterator was invalidated by a registry change during the walk.
+    private func collect(_ entry: io_registry_entry_t, creator inherited: (pid: Int, name: String)?, depth: Int, seen: inout Set<UInt64>, into list: inout [Client]) -> Bool {
+        let creator = self.creator(entry) ?? inherited
+        
+        if let creator, let gpuTime = self.gpuTime(entry) {
+            var id: UInt64 = 0
+            if IORegistryEntryGetRegistryEntryID(entry, &id) == kIOReturnSuccess, seen.insert(id).inserted {
+                list.append(Client(id: id, pid: creator.pid, name: creator.name, gpuTime: gpuTime))
+            }
+            return true
+        }
+        
+        guard depth < 2 else { return true }
+        
+        var children: io_iterator_t = io_iterator_t()
+        guard IORegistryEntryGetChildIterator(entry, kIOServicePlane, &children) == kIOReturnSuccess else { return true }
+        defer { IOObjectRelease(children) }
+        
+        var complete = true
+        var child = IOIteratorNext(children)
+        while child != 0 {
+            complete = self.collect(child, creator: creator, depth: depth + 1, seen: &seen, into: &list) && complete
+            IOObjectRelease(child)
+            child = IOIteratorNext(children)
+        }
+        
+        return complete && IOIteratorIsValid(children) != 0
+    }
+    
+    // "IOUserClientCreator" looks like "pid 173, WindowServer"
+    private func creator(_ entry: io_registry_entry_t) -> (pid: Int, name: String)? {
+        guard let property = IORegistryEntryCreateCFProperty(entry, "IOUserClientCreator" as CFString, kCFAllocatorDefault, 0),
+              let value = property.takeRetainedValue() as? String, value.hasPrefix("pid ") else {
+            return nil
+        }
+        let parts = value.dropFirst(4).split(separator: ",", maxSplits: 1)
+        guard let first = parts.first, let pid = Int(first.trimmingCharacters(in: .whitespaces)), pid > 0 else {
+            return nil
+        }
+        let name = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        return (pid, name)
+    }
+    
+    private func gpuTime(_ entry: io_registry_entry_t) -> UInt64? {
+        guard let property = IORegistryEntryCreateCFProperty(entry, "AppUsage" as CFString, kCFAllocatorDefault, 0),
+              let usage = property.takeRetainedValue() as? [[String: Any]] else {
+            return nil
+        }
+        return usage.reduce(UInt64(0)) { sum, queue in
+            sum + ((queue["accumulatedGPUTime"] as? NSNumber)?.uint64Value ?? 0)
+        }
+    }
+    
+    // The creator string is capped at 16 characters, so prefer the app name or the executable name.
+    private func processName(_ pid: Int, fallback: String) -> String {
+        if let app = NSRunningApplication(processIdentifier: pid_t(pid)), let name = app.localizedName, !name.isEmpty {
+            return name
+        }
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid_t(pid), &buffer, UInt32(buffer.count))
+        if length > 0 {
+            let path = String(decoding: buffer.prefix(Int(length)), as: UTF8.self)
+            if !path.isEmpty {
+                return URL(fileURLWithPath: path).lastPathComponent
+            }
+        }
+        return fallback.isEmpty ? "\(pid)" : fallback
+    }
+}
